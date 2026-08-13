@@ -2,11 +2,12 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/IOHIDEventSystemClient.h>
 #include <IOKit/hidsystem/IOHIDServiceClient.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <time.h>
 
 typedef struct CF_BRIDGED_TYPE(id) __IOHIDEvent *IOHIDEventRef;
 
@@ -54,10 +55,30 @@ static int CopyCFString(CFStringRef string, char *buf, size_t bufSize) {
     return CFStringGetCString(string, buf, (CFIndex)bufSize, kCFStringEncodingUTF8) != 0;
 }
 
+/* Natural sort: digit runs compare numerically, so "tdie2" < "tdie10". */
 static int CompareSensors(const void *a, const void *b) {
-    const SensorReading *left = (const SensorReading *)a;
-    const SensorReading *right = (const SensorReading *)b;
-    return strcmp(left->name, right->name);
+    const char *l = ((const SensorReading *)a)->name;
+    const char *r = ((const SensorReading *)b)->name;
+
+    while (*l && *r) {
+        if (isdigit((unsigned char)*l) && isdigit((unsigned char)*r)) {
+            char *lEnd, *rEnd;
+            unsigned long lv = strtoul(l, &lEnd, 10);
+            unsigned long rv = strtoul(r, &rEnd, 10);
+            if (lv != rv) {
+                return lv < rv ? -1 : 1;
+            }
+            l = lEnd;
+            r = rEnd;
+        } else {
+            if (*l != *r) {
+                return (unsigned char)*l < (unsigned char)*r ? -1 : 1;
+            }
+            l++;
+            r++;
+        }
+    }
+    return (int)(unsigned char)*l - (int)(unsigned char)*r;
 }
 
 static int ReadSensors(SensorReading *sensors, int maxSensors) {
@@ -128,10 +149,13 @@ static const char *SensorKind(const char *name) {
     return "other";
 }
 
-static int FindHotspot(const SensorReading *sensors, int count, SensorReading *out) {
+static int FindHotspot(const SensorReading *sensors, int count, int cpuOnly, SensorReading *out) {
     int found = 0;
     for (int i = 0; i < count; i++) {
         if (!sensors[i].valid || !IsDieSensor(sensors[i].name)) {
+            continue;
+        }
+        if (cpuOnly && strcmp(SensorKind(sensors[i].name), "cpu-die") != 0) {
             continue;
         }
         if (!found || sensors[i].temp_c > out->temp_c) {
@@ -146,8 +170,8 @@ static void PrintReadingHuman(const SensorReading *reading) {
     printf("%.2f C  %s\n", reading->temp_c, reading->name);
 }
 
-static void PrintHotspotHuman(const SensorReading *reading) {
-    printf("SoC hotspot: %.2f C  %s\n", reading->temp_c, reading->name);
+static void PrintHotspotHuman(const SensorReading *reading, int cpuOnly) {
+    printf("%s hotspot: %.2f C  %s\n", cpuOnly ? "CPU" : "SoC", reading->temp_c, reading->name);
 }
 
 static void PrintListHuman(const SensorReading *sensors, int count) {
@@ -157,14 +181,36 @@ static void PrintListHuman(const SensorReading *sensors, int count) {
     }
 }
 
+static void PrintJSONString(const char *s) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':
+            fputs("\\\"", stdout);
+            break;
+        case '\\':
+            fputs("\\\\", stdout);
+            break;
+        default:
+            if (*p < 0x20) {
+                printf("\\u%04x", *p);
+            } else {
+                putchar(*p);
+            }
+        }
+    }
+    putchar('"');
+}
+
 static void PrintListJSON(const SensorReading *sensors, int count) {
     printf("[");
     for (int i = 0; i < count; i++) {
         if (i > 0) {
             printf(",");
         }
-        printf("{\"name\":\"%s\",\"temp_c\":%.2f,\"kind\":\"%s\"}",
-               sensors[i].name,
+        printf("{\"name\":");
+        PrintJSONString(sensors[i].name);
+        printf(",\"temp_c\":%.2f,\"kind\":\"%s\"}",
                sensors[i].temp_c,
                SensorKind(sensors[i].name));
     }
@@ -172,7 +218,9 @@ static void PrintListJSON(const SensorReading *sensors, int count) {
 }
 
 static void PrintHotspotJSON(const SensorReading *reading) {
-    printf("{\"sensor\":\"%s\",\"temp_c\":%.2f}\n", reading->name, reading->temp_c);
+    printf("{\"sensor\":");
+    PrintJSONString(reading->name);
+    printf(",\"temp_c\":%.2f}\n", reading->temp_c);
 }
 
 static void PrintUsage(const char *argv0) {
@@ -183,6 +231,7 @@ static void PrintUsage(const char *argv0) {
             "The default metric is the hottest die sensor (name contains \"tdie\").\n"
             "\n"
             "Options:\n"
+            "  -c, --cpu               hotspot over CPU die sensors only (ignore GPU die)\n"
             "  -l, --list              list all temperature sensors\n"
             "  -s, --sensor NAME       print one sensor (exact or unique substring)\n"
             "  -w, --watch [SECONDS]   repeat continuously, default interval 1s\n"
@@ -218,7 +267,7 @@ static const SensorReading *FindSensorByName(const SensorReading *sensors,
     return NULL;
 }
 
-static void RunOnce(const char *sensorName, int jsonOutput, int listOutput) {
+static void RunOnce(const char *sensorName, int jsonOutput, int listOutput, int cpuOnly) {
     SensorReading sensors[256];
     int count = ReadSensors(sensors, (int)(sizeof(sensors) / sizeof(sensors[0])));
     if (count < 0) {
@@ -254,14 +303,15 @@ static void RunOnce(const char *sensorName, int jsonOutput, int listOutput) {
     }
 
     SensorReading hotspot;
-    if (!FindHotspot(sensors, count, &hotspot)) {
-        fprintf(stderr, "no die temperature sensors found\n");
+    if (!FindHotspot(sensors, count, cpuOnly, &hotspot)) {
+        fprintf(stderr, cpuOnly ? "no CPU die temperature sensors found\n"
+                                : "no die temperature sensors found\n");
         exit(1);
     }
     if (jsonOutput) {
         PrintHotspotJSON(&hotspot);
     } else {
-        PrintHotspotHuman(&hotspot);
+        PrintHotspotHuman(&hotspot, cpuOnly);
     }
 }
 
@@ -270,11 +320,14 @@ int main(int argc, char **argv) {
     int listOutput = 0;
     int jsonOutput = 0;
     int watchOutput = 0;
+    int cpuOnly = 0;
     double interval = 1.0;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        if (strcmp(arg, "-l") == 0 || strcmp(arg, "--list") == 0) {
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--cpu") == 0) {
+            cpuOnly = 1;
+        } else if (strcmp(arg, "-l") == 0 || strcmp(arg, "--list") == 0) {
             listOutput = 1;
         } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--sensor") == 0) {
             if (i + 1 >= argc) {
@@ -304,17 +357,27 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (interval <= 0.0) {
+    /* !(x > 0) instead of (x <= 0) so NaN is rejected too. */
+    if (!(interval > 0.0)) {
         fprintf(stderr, "interval must be greater than zero\n");
+        return 1;
+    }
+    if (interval > 86400.0) {
+        fprintf(stderr, "interval too large (max 86400 seconds)\n");
         return 1;
     }
 
     if (!watchOutput) {
-        RunOnce(sensorName, jsonOutput, listOutput);
+        RunOnce(sensorName, jsonOutput, listOutput, cpuOnly);
         return 0;
     }
 
-    useconds_t sleepMicros = (useconds_t)(interval * 1000000.0);
+    struct timespec sleepTime;
+    sleepTime.tv_sec = (time_t)interval;
+    sleepTime.tv_nsec = (long)((interval - (double)sleepTime.tv_sec) * 1000000000.0);
+    if (sleepTime.tv_nsec > 999999999L) {
+        sleepTime.tv_nsec = 999999999L;
+    }
     for (;;) {
         SensorReading sensors[256];
         int count = ReadSensors(sensors, (int)(sizeof(sensors) / sizeof(sensors[0])));
@@ -342,18 +405,20 @@ int main(int argc, char **argv) {
             }
         } else {
             SensorReading hotspot;
-            if (!FindHotspot(sensors, count, &hotspot)) {
-                fprintf(stderr, "no die temperature sensors found\n");
+            if (!FindHotspot(sensors, count, cpuOnly, &hotspot)) {
+                fprintf(stderr, cpuOnly ? "no CPU die temperature sensors found\n"
+                                        : "no die temperature sensors found\n");
                 return 1;
             }
             if (jsonOutput) {
                 PrintHotspotJSON(&hotspot);
             } else {
-                PrintHotspotHuman(&hotspot);
+                PrintHotspotHuman(&hotspot, cpuOnly);
             }
         }
 
         fflush(stdout);
-        usleep(sleepMicros);
+        nanosleep(&sleepTime, NULL);
     }
 }
+
